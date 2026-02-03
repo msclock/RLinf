@@ -17,10 +17,8 @@ from typing import Any, Optional, Union
 
 import imageio
 import numpy as np
-import tensorflow as tf
 import torch
 from PIL import Image, ImageDraw, ImageFont
-
 
 def to_tensor(
     array: Union[dict, torch.Tensor, np.ndarray, list, Any], device: str = "cpu"
@@ -57,7 +55,6 @@ def to_tensor(
         ret = ret.to(torch.float32)
     return ret
 
-
 def list_of_dict_to_dict_of_list(
     list_of_dict: list[dict[str, Any]],
 ) -> dict[str, list[Any]]:
@@ -80,7 +77,6 @@ def list_of_dict_to_dict_of_list(
             output[key].append(item)
     return output
 
-
 def save_rollout_video(
     rollout_images: list[np.ndarray], output_dir: str, video_name: str, fps: int = 30
 ) -> None:
@@ -99,7 +95,6 @@ def save_rollout_video(
     for img in rollout_images:
         video_writer.append_data(img)
     video_writer.close()
-
 
 def tile_images(
     images: list[Union[np.ndarray, torch.Tensor]], nrows: int = 1
@@ -167,7 +162,6 @@ def tile_images(
         cur_x = next_x
     return output_image
 
-
 def put_text_on_image(
     image: np.ndarray, lines: list[str], max_width: int = 200
 ) -> np.ndarray:
@@ -211,7 +205,6 @@ def put_text_on_image(
         draw.text((x, y), text=line, fill=(0, 0, 0))
     return np.array(image)
 
-
 def put_info_on_image(
     image: np.ndarray,
     info: dict[str, float],
@@ -235,60 +228,100 @@ def put_info_on_image(
         lines.extend(extras)
     return put_text_on_image(image, lines)
 
-
-def crop_and_resize(image, crop_scale, batch_size):
+def crop_and_resize(image, crop_scale, batch_size, out_size=(224, 224)):
     """
-    Center-crops an image to have area `crop_scale` * (original image area), and then resizes back
-    to original size. We use the same logic seen in the `dlimp` RLDS datasets wrapper to avoid
-    distribution shift at test time.
+    Center-crops an image (or batch of images) to have area `crop_scale` * (original image area),
+    and then resizes each crop back to `out_size`.
+
+    Args:
+        image: numpy array or PIL Image. Supported shapes: (H, W, C) or (B, H, W, C).
+        crop_scale: scalar or array-like of length batch_size. Interpreted as area scale; we use sqrt(crop_scale)
+            to get per-side scale like the original TF implementation.
+        batch_size: number of images in the batch (if image is single image, batch_size should be 1).
+        out_size: (height, width) tuple for the output size.
+
+    Returns:
+        numpy array of shape (B, out_h, out_w, C) if input was batched, otherwise (out_h, out_w, C).
     """
-    assert image.shape.ndims == 3 or image.shape.ndims == 4
-    expanded_dims = False
-    if image.shape.ndims == 3:
-        image = tf.expand_dims(image, axis=0)
-        expanded_dims = True
+    # Convert PIL Image to numpy array if necessary
+    if isinstance(image, Image.Image):
+        arr = np.array(image)
+    else:
+        arr = np.asarray(image)
 
-    new_heights = tf.reshape(
-        tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,)
-    )
-    new_widths = tf.reshape(
-        tf.clip_by_value(tf.sqrt(crop_scale), 0, 1), shape=(batch_size,)
-    )
+    single = False
+    if arr.ndim == 3:
+        # (H, W, C) -> make batch dim
+        arr = np.expand_dims(arr, 0)
+        single = True
+    elif arr.ndim != 4:
+        raise ValueError("Unsupported image array shape: %r" % (arr.shape,))
 
-    height_offsets = (1 - new_heights) / 2
-    width_offsets = (1 - new_widths) / 2
-    bounding_boxes = tf.stack(
-        [
-            height_offsets,
-            width_offsets,
-            height_offsets + new_heights,
-            width_offsets + new_widths,
-        ],
-        axis=1,
-    )
+    B, H, W, C = arr.shape
+    if B != batch_size:
+        # allow batch_size mismatch by using actual batch size
+        batch_size = B
 
-    image = tf.image.crop_and_resize(
-        image, bounding_boxes, tf.range(batch_size), (224, 224)
-    )
+    # Normalize crop_scale to array of length batch_size
+    if np.isscalar(crop_scale):
+        scales = np.full(batch_size, float(crop_scale), dtype=float)
+    else:
+        scales = np.asarray(crop_scale, dtype=float)
+        if scales.shape[0] != batch_size:
+            raise ValueError("crop_scale must be scalar or have length batch_size")
 
-    if expanded_dims:
-        image = image[0]
+    scales = np.clip(np.sqrt(scales), 0.0, 1.0)
 
-    return image
+    outputs = []
+    for i in range(batch_size):
+        s = scales[i]
+        new_h = max(1, int(round(H * s)))
+        new_w = max(1, int(round(W * s)))
+        top = (H - new_h) // 2
+        left = (W - new_w) // 2
+        bottom = top + new_h
+        right = left + new_w
 
+        crop = arr[i, top:bottom, left:right]
+        pil = Image.fromarray(crop)
+        resized = pil.resize((out_size[1], out_size[0]), resample=Image.BILINEAR)
+        out_arr = np.asarray(resized)
+        # If original had single channel, ensure shape consistency
+        if out_arr.ndim == 2:
+            out_arr = out_arr[:, :, None]
+        outputs.append(out_arr)
+
+    out = np.stack(outputs, axis=0)
+    if single:
+        return out[0]
+    return out
 
 def center_crop_image(image):
     batch_size = 1
     crop_scale = 0.9
 
-    image = tf.convert_to_tensor(np.array(image))
-    orig_dtype = image.dtype
+    # Accept PIL.Image or numpy array
+    if isinstance(image, Image.Image):
+        pil = image
+    else:
+        arr = np.asarray(image)
+        # If grayscale array (H, W) or (H, W, 1), convert to RGB for consistent processing
+        if arr.ndim == 2:
+            pil = Image.fromarray(arr).convert("RGB")
+        elif arr.ndim == 3 and arr.shape[2] == 1:
+            pil = Image.fromarray(arr.squeeze(-1)).convert("RGB")
+        else:
+            pil = Image.fromarray(arr)
 
-    image = tf.image.convert_image_dtype(image, tf.float32)
-    image = crop_and_resize(image, crop_scale, batch_size)
-    image = tf.clip_by_value(image, 0, 1)
-    image = tf.image.convert_image_dtype(image, orig_dtype, saturate=True)
+    orig_mode = pil.mode
 
-    image = Image.fromarray(image.numpy())
-    image = image.convert("RGB")
-    return image
+    # Convert to uint8 RGB processing to match previous behavior
+    pil = pil.convert("RGB")
+
+    # Perform crop and resize using the numpy/Pillow implementation
+    cropped_resized = crop_and_resize(np.array(pil), crop_scale, batch_size, out_size=(224, 224))
+
+    # Convert back to PIL Image and to original mode if appropriate
+    image_out = Image.fromarray(cropped_resized)
+    image_out = image_out.convert("RGB")
+    return image_out
